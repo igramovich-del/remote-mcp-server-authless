@@ -2,6 +2,38 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 
+// Helper: safely read an Adapty response and show what actually came back,
+// plus a masked preview of the key we sent, without ever exposing the full secret.
+async function describeAdaptyResponse(res: Response, keyUsed: string | undefined) {
+	const raw = await res.text();
+	let parsed: unknown = null;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		// not JSON, that's fine — we show the raw text below
+	}
+	const keyPreview = keyUsed
+		? `${keyUsed.slice(0, 8)}...${keyUsed.slice(-4)} (length ${keyUsed.length})`
+		: "ADAPTY_API_KEY is undefined/empty";
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify(
+					{
+						http_status: res.status,
+						ok: res.ok,
+						key_used: keyPreview,
+						body: parsed ?? raw,
+					},
+					null,
+					2,
+				),
+			},
+		],
+	};
+}
+
 // Define our MCP agent with tools
 export class MyMCP extends McpAgent {
 	server = new McpServer({
@@ -81,10 +113,7 @@ export class MyMCP extends McpAgent {
 						},
 					},
 				);
-				const data = await res.json();
-				return {
-					content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-				};
+				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY);
 			},
 		);
 
@@ -115,10 +144,7 @@ export class MyMCP extends McpAgent {
 						}),
 					},
 				);
-				const data = await res.json();
-				return {
-					content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-				};
+				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY);
 			},
 		);
 	}
