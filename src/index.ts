@@ -57,6 +57,70 @@ export class MyMCP extends McpAgent {
 				return { content: [{ type: "text", text: String(result) }] };
 			},
 		);
+
+		// Adapty: профиль подписчика по customer_user_id
+		this.server.registerTool(
+			"get_subscriber_profile",
+			{
+				description:
+					"Профиль подписчика Adapty (подписки, покупки, revenue) по customer_user_id",
+				inputSchema: {
+					customer_user_id: z
+						.string()
+						.describe("customer_user_id из вашего приложения"),
+				},
+			},
+			async ({ customer_user_id }) => {
+				const res = await fetch(
+					"https://api.adapty.io/api/v2/server-side-api/profile/",
+					{
+						method: "GET",
+						headers: {
+							Authorization: `Api-Key ${this.env.ADAPTY_API_KEY}`,
+							"adapty-customer-user-id": customer_user_id,
+						},
+					},
+				);
+				const data = await res.json();
+				return {
+					content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+				};
+			},
+		);
+
+		// Adapty: аналитика revenue за период
+		this.server.registerTool(
+			"get_revenue_analytics",
+			{
+				description: "Аналитика revenue из Adapty за период",
+				inputSchema: {
+					date_from: z.string().describe("Дата начала, YYYY-MM-DD"),
+					date_to: z.string().describe("Дата конца, YYYY-MM-DD"),
+					period_unit: z.enum(["day", "week", "month"]).default("week"),
+				},
+			},
+			async ({ date_from, date_to, period_unit }) => {
+				const res = await fetch(
+					"https://api-admin.adapty.io/api/v1/client-api/metrics/analytics/",
+					{
+						method: "POST",
+						headers: {
+							Authorization: `Api-Key ${this.env.ADAPTY_API_KEY}`,
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({
+							chart_id: "revenue",
+							filters: { date: [date_from, date_to] },
+							period_unit,
+						}),
+					},
+				);
+				const data = await res.json();
+				return {
+					content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+				};
+			},
+		);
 	}
 }
 
