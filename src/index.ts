@@ -2,38 +2,32 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 
-// Helper: safely read an Adapty response and show what actually came back,
-// plus a masked preview of the key we sent, without ever exposing the full secret.
-async function describeAdaptyResponse(
-	res: Response,
-	keyUsed: string | undefined,
-	env: unknown,
-) {
-	const raw = await res.text();
-	let parsed: unknown = null;
+// ============================================================
+// Multi-app key resolution
+// Все ключи 30 приложений хранятся в ОДНОМ секрете Cloudflare
+// с именем ADAPTY_APP_KEYS, значение — JSON-объект вида:
+//   {"App One": "secret_live_...", "App Two": "secret_live_...", ...}
+// Это вместо 30 отдельных секретов — их пришлось бы заводить
+// вручную через дашборд, что при масштабе 30 штук — верный
+// способ повторить всю прошлую эпопею с одним ключом.
+// ============================================================
+function getAdaptyKeys(env: any): Record<string, string> {
 	try {
-		parsed = JSON.parse(raw);
+		return JSON.parse(env.ADAPTY_APP_KEYS ?? "{}");
 	} catch {
-		// not JSON, that's fine — we show the raw text below
+		return {};
 	}
-	const keyPreview = keyUsed
-		? `${keyUsed.slice(0, 8)}...${keyUsed.slice(-4)} (length ${keyUsed.length})`
-		: "ADAPTY_API_KEY is undefined/empty";
-	// Names only, never values — shows what the Worker actually sees bound at runtime,
-	// regardless of what the dashboard displays.
-	const visibleBindingNames =
-		env && typeof env === "object" ? Object.keys(env as object) : [];
+}
+
+function appNotConfiguredResult(env: any, app: string) {
 	return {
 		content: [
 			{
 				type: "text" as const,
 				text: JSON.stringify(
 					{
-						http_status: res.status,
-						ok: res.ok,
-						key_used: keyPreview,
-						visible_binding_names: visibleBindingNames,
-						body: parsed ?? raw,
+						error: `Приложение "${app}" не найдено в ADAPTY_APP_KEYS`,
+						available_apps: Object.keys(getAdaptyKeys(env)),
 					},
 					null,
 					2,
@@ -43,15 +37,138 @@ async function describeAdaptyResponse(
 	};
 }
 
-// Define our MCP agent with tools
+// ============================================================
+// Shared response handling — никогда не падает на не-JSON ответе,
+// всегда показывает HTTP-статус.
+// ============================================================
+async function describeAdaptyResponse(res: Response) {
+	const raw = await res.text();
+	let parsed: unknown = null;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		// not JSON — fall back to raw text below
+	}
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify(
+					{ http_status: res.status, ok: res.ok, body: parsed ?? raw },
+					null,
+					2,
+				),
+			},
+		],
+	};
+}
+
+// POST-запрос к api-admin.adapty.io (все /metrics/* и /exports/placements/ эндпоинты)
+async function postToAdapty(env: any, app: string, path: string, body: unknown) {
+	const key = getAdaptyKeys(env)[app];
+	if (!key) return appNotConfiguredResult(env, app);
+	const res = await fetch(`https://api-admin.adapty.io${path}`, {
+		method: "POST",
+		headers: {
+			Authorization: `Api-Key ${key}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify(body),
+	});
+	return describeAdaptyResponse(res);
+}
+
+// ============================================================
+// Общие поля фильтров (MetricsFilters из спеки Adapty),
+// используются в analytics/cohort/conversion/funnel/ltv/retention
+// ============================================================
+const metricsFilterFields = {
+	date_from: z.string().describe("Дата начала периода, YYYY-MM-DD"),
+	date_to: z.string().describe("Дата конца периода, YYYY-MM-DD"),
+	compare_date_from: z
+		.string()
+		.optional()
+		.describe("Начало периода сравнения, YYYY-MM-DD (опционально)"),
+	compare_date_to: z
+		.string()
+		.optional()
+		.describe("Конец периода сравнения, YYYY-MM-DD (опционально)"),
+	country: z
+		.array(z.string())
+		.optional()
+		.describe('Фильтр по странам, 2-буквенный код, например ["us","de"]'),
+	store: z
+		.array(z.string())
+		.optional()
+		.describe('Фильтр по стору, например ["app_store","play_store"]'),
+	store_product_id: z
+		.array(z.string())
+		.optional()
+		.describe("Фильтр по ID продукта в сторе"),
+	duration: z.array(z.string()).optional().describe("Длительность подписки"),
+	attribution_source: z
+		.array(z.string())
+		.optional()
+		.describe("Источник атрибуции, например appsflyer"),
+	attribution_status: z
+		.array(z.string())
+		.optional()
+		.describe("organic / non-organic"),
+	attribution_channel: z
+		.array(z.string())
+		.optional()
+		.describe("Маркетинговый канал"),
+	attribution_campaign: z
+		.array(z.string())
+		.optional()
+		.describe("Маркетинговая кампания"),
+	attribution_adgroup: z.array(z.string()).optional().describe("Рекламная группа"),
+	attribution_adset: z.array(z.string()).optional().describe("Рекламный сет"),
+	attribution_creative: z.array(z.string()).optional().describe("Креатив"),
+	offer_category: z.array(z.string()).optional().describe("Категория оффера"),
+	offer_type: z.array(z.string()).optional().describe("Тип оффера"),
+	offer_id: z.array(z.string()).optional().describe("ID конкретного оффера"),
+};
+
+const optionalFilterKeys = [
+	"country",
+	"store",
+	"store_product_id",
+	"duration",
+	"attribution_source",
+	"attribution_status",
+	"attribution_channel",
+	"attribution_campaign",
+	"attribution_adgroup",
+	"attribution_adset",
+	"attribution_creative",
+	"offer_category",
+	"offer_type",
+	"offer_id",
+] as const;
+
+function buildFilters(a: Record<string, unknown>) {
+	const filters: Record<string, unknown> = { date: [a.date_from, a.date_to] };
+	if (a.compare_date_from && a.compare_date_to) {
+		filters.compare_date = [a.compare_date_from, a.compare_date_to];
+	}
+	for (const key of optionalFilterKeys) {
+		if (a[key] !== undefined) filters[key] = a[key];
+	}
+	return filters;
+}
+
+// ============================================================
+// MCP agent
+// ============================================================
 export class MyMCP extends McpAgent {
 	server = new McpServer({
-		name: "Authless Calculator",
+		name: "Adapty Analytics (multi-app)",
 		version: "1.0.0",
 	});
 
 	async init() {
-		// Simple addition tool
+		// Simple addition tool (из исходного шаблона)
 		this.server.registerTool(
 			"add",
 			{ inputSchema: { a: z.number(), b: z.number() } },
@@ -60,7 +177,7 @@ export class MyMCP extends McpAgent {
 			}),
 		);
 
-		// Calculator tool with multiple operations
+		// Calculator tool (из исходного шаблона)
 		this.server.registerTool(
 			"calculate",
 			{
@@ -86,10 +203,7 @@ export class MyMCP extends McpAgent {
 						if (b === 0)
 							return {
 								content: [
-									{
-										type: "text",
-										text: "Error: Cannot divide by zero",
-									},
+									{ type: "text", text: "Error: Cannot divide by zero" },
 								],
 							};
 						result = a / b;
@@ -99,61 +213,317 @@ export class MyMCP extends McpAgent {
 			},
 		);
 
-		// Adapty: профиль подписчика по customer_user_id
+		// ---------- list_apps ----------
+		this.server.registerTool(
+			"list_apps",
+			{
+				description:
+					"Список названий приложений Adapty, настроенных в ADAPTY_APP_KEYS (без самих ключей)",
+			},
+			async () => ({
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify(
+							{ apps: Object.keys(getAdaptyKeys(this.env)) },
+							null,
+							2,
+						),
+					},
+				],
+			}),
+		);
+
+		// ---------- get_subscriber_profile ----------
 		this.server.registerTool(
 			"get_subscriber_profile",
 			{
 				description:
-					"Профиль подписчика Adapty (подписки, покупки, revenue) по customer_user_id",
+					"Профиль подписчика Adapty (подписки, покупки, revenue) по customer_user_id, для конкретного приложения",
 				inputSchema: {
+					app: z.string().describe("Название приложения (см. list_apps)"),
 					customer_user_id: z
 						.string()
 						.describe("customer_user_id из вашего приложения"),
 				},
 			},
-			async ({ customer_user_id }) => {
+			async ({ app, customer_user_id }) => {
+				const key = getAdaptyKeys(this.env)[app];
+				if (!key) return appNotConfiguredResult(this.env, app);
 				const res = await fetch(
 					"https://api.adapty.io/api/v2/server-side-api/profile/",
 					{
 						method: "GET",
 						headers: {
-							Authorization: `Api-Key ${this.env.ADAPTY_API_KEY}`,
+							Authorization: `Api-Key ${key}`,
 							"adapty-customer-user-id": customer_user_id,
 						},
 					},
 				);
-				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY, this.env);
+				return describeAdaptyResponse(res);
 			},
 		);
 
-		// Adapty: аналитика revenue за период
+		// ---------- get_analytics (revenue, mrr, arr, installs, подписки, триалы, ...) ----------
 		this.server.registerTool(
-			"get_revenue_analytics",
+			"get_analytics",
 			{
-				description: "Аналитика revenue из Adapty за период",
+				description:
+					"Универсальный график аналитики Adapty по одному приложению: revenue, mrr, arr, arppu, arpu, installs, активные/новые/отменённые/истёкшие подписки и триалы, grace period, billing issues, возвраты",
 				inputSchema: {
-					date_from: z.string().describe("Дата начала, YYYY-MM-DD"),
-					date_to: z.string().describe("Дата конца, YYYY-MM-DD"),
-					period_unit: z.enum(["day", "week", "month"]).default("week"),
+					app: z.string().describe("Название приложения (см. list_apps)"),
+					chart_id: z
+						.enum([
+							"revenue",
+							"mrr",
+							"arr",
+							"arppu",
+							"arpu",
+							"installs",
+							"subscriptions_active",
+							"subscriptions_new",
+							"subscriptions_renewal_cancelled",
+							"subscriptions_expired",
+							"trials_active",
+							"trials_new",
+							"trials_renewal_cancelled",
+							"trials_expired",
+							"grace_period",
+							"billing_issue",
+							"refund_events",
+							"refund_money",
+							"non_subscriptions",
+						])
+						.describe("Какой график нужен"),
+					period_unit: z
+						.enum(["day", "week", "month", "quarter", "year"])
+						.optional()
+						.describe("Гранулярность, по умолчанию month"),
+					date_type: z
+						.enum(["purchase_date", "profile_install_date"])
+						.optional(),
+					segmentation: z
+						.string()
+						.optional()
+						.describe("Поле для сегментации, например attribution_campaign"),
+					...metricsFilterFields,
 				},
 			},
-			async ({ date_from, date_to, period_unit }) => {
-				const res = await fetch(
-					"https://api-admin.adapty.io/api/v1/client-api/metrics/analytics/",
-					{
-						method: "POST",
-						headers: {
-							Authorization: `Api-Key ${this.env.ADAPTY_API_KEY}`,
-							"Content-Type": "application/json",
-						},
-						body: JSON.stringify({
-							chart_id: "revenue",
-							filters: { date: [date_from, date_to] },
-							period_unit,
-						}),
-					},
+			async ({ app, chart_id, period_unit, date_type, segmentation, ...filterArgs }) => {
+				const body: Record<string, unknown> = {
+					chart_id,
+					filters: buildFilters(filterArgs),
+				};
+				if (period_unit) body.period_unit = period_unit;
+				if (date_type) body.date_type = date_type;
+				if (segmentation) body.segmentation = segmentation;
+				return postToAdapty(
+					this.env,
+					app,
+					"/api/v1/client-api/metrics/analytics/",
+					body,
 				);
-				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY, this.env);
+			},
+		);
+
+		// ---------- get_cohort_data ----------
+		this.server.registerTool(
+			"get_cohort_data",
+			{
+				description:
+					"Когортный анализ Adapty: revenue/arppu/arpu/arpas/подписчики/подписки по когортам, с опциональным прогнозом",
+				inputSchema: {
+					app: z.string().describe("Название приложения (см. list_apps)"),
+					period_unit: z
+						.enum(["day", "week", "month", "quarter", "year"])
+						.optional(),
+					period_type: z.enum(["renewals", "days"]).optional(),
+					value_type: z.enum(["absolute", "relative"]).optional(),
+					value_field: z
+						.enum(["revenue", "arppu", "arpu", "arpas", "subscribers", "subscriptions"])
+						.optional(),
+					accounting_type: z
+						.enum(["revenue", "proceeds", "net_revenue"])
+						.optional(),
+					prediction_months: z
+						.union([
+							z.literal(3),
+							z.literal(6),
+							z.literal(9),
+							z.literal(12),
+							z.literal(18),
+							z.literal(24),
+						])
+						.optional()
+						.describe("Горизонт прогноза в месяцах"),
+					...metricsFilterFields,
+				},
+			},
+			async ({
+				app,
+				period_unit,
+				period_type,
+				value_type,
+				value_field,
+				accounting_type,
+				prediction_months,
+				...filterArgs
+			}) => {
+				const body: Record<string, unknown> = { filters: buildFilters(filterArgs) };
+				if (period_unit) body.period_unit = period_unit;
+				if (period_type) body.period_type = period_type;
+				if (value_type) body.value_type = value_type;
+				if (value_field) body.value_field = value_field;
+				if (accounting_type) body.accounting_type = accounting_type;
+				if (prediction_months !== undefined)
+					body.prediction_months = prediction_months;
+				return postToAdapty(this.env, app, "/api/v1/client-api/metrics/cohort/", body);
+			},
+		);
+
+		// ---------- get_conversion_data ----------
+		this.server.registerTool(
+			"get_conversion_data",
+			{
+				description:
+					"Конверсия между состояниями подписки (например из триала в оплаченную, из 1 месяца в 6+)",
+				inputSchema: {
+					app: z.string().describe("Название приложения (см. list_apps)"),
+					from_period: z
+						.string()
+						.nullable()
+						.describe('Начальное состояние, например "1" или "trial"'),
+					to_period: z.string().describe('Целевое состояние, например "6+"'),
+					period_unit: z
+						.enum(["day", "week", "month", "quarter", "year"])
+						.optional(),
+					date_type: z
+						.enum(["purchase_date", "profile_install_date"])
+						.optional(),
+					segmentation: z.string().optional(),
+					...metricsFilterFields,
+				},
+			},
+			async ({
+				app,
+				from_period,
+				to_period,
+				period_unit,
+				date_type,
+				segmentation,
+				...filterArgs
+			}) => {
+				const body: Record<string, unknown> = {
+					from_period,
+					to_period,
+					filters: buildFilters(filterArgs),
+				};
+				if (period_unit) body.period_unit = period_unit;
+				if (date_type) body.date_type = date_type;
+				if (segmentation) body.segmentation = segmentation;
+				return postToAdapty(
+					this.env,
+					app,
+					"/api/v1/client-api/metrics/conversion/",
+					body,
+				);
+			},
+		);
+
+		// ---------- get_funnel_data ----------
+		this.server.registerTool(
+			"get_funnel_data",
+			{
+				description:
+					"Воронка: продвижение пользователей по этапам (install → paywall → покупка и т.д.)",
+				inputSchema: {
+					app: z.string().describe("Название приложения (см. list_apps)"),
+					period_unit: z
+						.enum(["day", "week", "month", "quarter", "year"])
+						.optional(),
+					show_value_as: z.enum(["absolute", "relative", "both"]).optional(),
+					segmentation: z.string().optional(),
+					...metricsFilterFields,
+				},
+			},
+			async ({ app, period_unit, show_value_as, segmentation, ...filterArgs }) => {
+				const body: Record<string, unknown> = { filters: buildFilters(filterArgs) };
+				if (period_unit) body.period_unit = period_unit;
+				if (show_value_as) body.show_value_as = show_value_as;
+				if (segmentation) body.segmentation = segmentation;
+				return postToAdapty(this.env, app, "/api/v1/client-api/metrics/funnel/", body);
+			},
+		);
+
+		// ---------- get_ltv_data ----------
+		this.server.registerTool(
+			"get_ltv_data",
+			{
+				description:
+					"Lifetime Value (LTV): revenue/proceeds/net_revenue на подписчика за период",
+				inputSchema: {
+					app: z.string().describe("Название приложения (см. list_apps)"),
+					period_unit: z
+						.enum(["day", "week", "month", "quarter", "year"])
+						.optional(),
+					period_type: z.enum(["renewals", "days"]).optional(),
+					segmentation: z.string().optional(),
+					...metricsFilterFields,
+				},
+			},
+			async ({ app, period_unit, period_type, segmentation, ...filterArgs }) => {
+				const body: Record<string, unknown> = { filters: buildFilters(filterArgs) };
+				if (period_unit) body.period_unit = period_unit;
+				if (period_type) body.period_type = period_type;
+				if (segmentation) body.segmentation = segmentation;
+				return postToAdapty(this.env, app, "/api/v1/client-api/metrics/ltv/", body);
+			},
+		);
+
+		// ---------- get_retention_data ----------
+		this.server.registerTool(
+			"get_retention_data",
+			{
+				description: "Retention: удержание пользователей/подписчиков во времени",
+				inputSchema: {
+					app: z.string().describe("Название приложения (см. list_apps)"),
+					period_unit: z
+						.enum(["day", "week", "month", "quarter", "year"])
+						.optional(),
+					segmentation: z.string().optional(),
+					use_trial: z.boolean().optional().describe("Учитывать ли триалы"),
+					...metricsFilterFields,
+				},
+			},
+			async ({ app, period_unit, segmentation, use_trial, ...filterArgs }) => {
+				const body: Record<string, unknown> = { filters: buildFilters(filterArgs) };
+				if (period_unit) body.period_unit = period_unit;
+				if (segmentation) body.segmentation = segmentation;
+				if (use_trial !== undefined) body.use_trial = use_trial;
+				return postToAdapty(
+					this.env,
+					app,
+					"/api/v1/client-api/metrics/retention/",
+					body,
+				);
+			},
+		);
+
+		// ---------- get_placement_info ----------
+		this.server.registerTool(
+			"get_placement_info",
+			{
+				description:
+					"Информация о пейволлах/онбордингах: аудитории, сегменты, A/B-тесты",
+				inputSchema: {
+					app: z.string().describe("Название приложения (см. list_apps)"),
+					placement_type: z.enum(["paywall", "onboarding"]),
+				},
+			},
+			async ({ app, placement_type }) => {
+				return postToAdapty(this.env, app, "/api/v1/client-api/exports/placements/", {
+					filters: { placement_type },
+				});
 			},
 		);
 	}
