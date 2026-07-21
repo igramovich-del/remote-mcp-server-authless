@@ -11,34 +11,58 @@ import { z } from "zod";
 // вручную через дашборд, что при масштабе 30 штук — верный
 // способ повторить всю прошлую эпопею с одним ключом.
 // ============================================================
+// Cloudflare's dashboard "JSON" variable type delivers an ALREADY-PARSED
+// object to env (not a string) — while a "Text"/"Secret" type holding JSON
+// text delivers a raw string that still needs JSON.parse. Handle both.
 function getAdaptyKeys(env: any): Record<string, string> {
-	try {
-		return JSON.parse(env.ADAPTY_APP_KEYS ?? "{}");
-	} catch {
-		return {};
+	const raw = env?.ADAPTY_APP_KEYS;
+	if (raw && typeof raw === "object") {
+		return raw as Record<string, string>;
 	}
+	if (typeof raw === "string" && raw.length > 0) {
+		try {
+			return JSON.parse(raw);
+		} catch {
+			return {};
+		}
+	}
+	return {};
 }
 
 // Диагностика: почему available_apps может оказаться пустым —
-// переменная не задана вообще, задана пустой строкой, или не парсится как JSON.
+// переменная не задана вообще, задана пустой строкой, не парсится как JSON,
+// либо (см. выше) пришла уже готовым объектом от типа "JSON" в Cloudflare.
 // Не палит сами ключи — только длину/превью первых символов и факт наличия.
 function diagnoseAdaptyAppKeys(env: any) {
 	const raw = env?.ADAPTY_APP_KEYS;
+	if (raw && typeof raw === "object") {
+		return {
+			adapty_app_keys_present: true,
+			binding_shape: "object (Cloudflare JSON var type — уже распарсено)",
+			apps: Object.keys(raw),
+		};
+	}
 	const present = typeof raw === "string" && raw.length > 0;
+	if (!present) {
+		return {
+			adapty_app_keys_present: false,
+			binding_shape: typeof raw,
+			apps: [],
+		};
+	}
 	let jsonParseError: string | null = null;
 	let apps: string[] = [];
-	if (present) {
-		try {
-			apps = Object.keys(JSON.parse(raw));
-		} catch (e: any) {
-			jsonParseError = String(e?.message ?? e);
-		}
+	try {
+		apps = Object.keys(JSON.parse(raw));
+	} catch (e: any) {
+		jsonParseError = String(e?.message ?? e);
 	}
 	return {
-		adapty_app_keys_present: present,
-		adapty_app_keys_length: present ? raw.length : 0,
-		adapty_app_keys_starts_with: present ? raw.slice(0, 15) : null,
-		adapty_app_keys_ends_with: present ? raw.slice(-15) : null,
+		adapty_app_keys_present: true,
+		binding_shape: "string (Text/Secret var type — распарсено вручную)",
+		adapty_app_keys_length: raw.length,
+		adapty_app_keys_starts_with: raw.slice(0, 15),
+		adapty_app_keys_ends_with: raw.slice(-15),
 		json_parse_error: jsonParseError,
 		apps,
 	};
