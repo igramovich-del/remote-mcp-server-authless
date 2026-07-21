@@ -19,6 +19,31 @@ function getAdaptyKeys(env: any): Record<string, string> {
 	}
 }
 
+// Диагностика: почему available_apps может оказаться пустым —
+// переменная не задана вообще, задана пустой строкой, или не парсится как JSON.
+// Не палит сами ключи — только длину/превью первых символов и факт наличия.
+function diagnoseAdaptyAppKeys(env: any) {
+	const raw = env?.ADAPTY_APP_KEYS;
+	const present = typeof raw === "string" && raw.length > 0;
+	let jsonParseError: string | null = null;
+	let apps: string[] = [];
+	if (present) {
+		try {
+			apps = Object.keys(JSON.parse(raw));
+		} catch (e: any) {
+			jsonParseError = String(e?.message ?? e);
+		}
+	}
+	return {
+		adapty_app_keys_present: present,
+		adapty_app_keys_length: present ? raw.length : 0,
+		adapty_app_keys_starts_with: present ? raw.slice(0, 15) : null,
+		adapty_app_keys_ends_with: present ? raw.slice(-15) : null,
+		json_parse_error: jsonParseError,
+		apps,
+	};
+}
+
 function appNotConfiguredResult(env: any, app: string) {
 	return {
 		content: [
@@ -27,7 +52,7 @@ function appNotConfiguredResult(env: any, app: string) {
 				text: JSON.stringify(
 					{
 						error: `Приложение "${app}" не найдено в ADAPTY_APP_KEYS`,
-						available_apps: Object.keys(getAdaptyKeys(env)),
+						diagnostics: diagnoseAdaptyAppKeys(env),
 					},
 					null,
 					2,
@@ -224,11 +249,7 @@ export class MyMCP extends McpAgent {
 				content: [
 					{
 						type: "text",
-						text: JSON.stringify(
-							{ apps: Object.keys(getAdaptyKeys(this.env)) },
-							null,
-							2,
-						),
+						text: JSON.stringify(diagnoseAdaptyAppKeys(this.env), null, 2),
 					},
 				],
 			}),
