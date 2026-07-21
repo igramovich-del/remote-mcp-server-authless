@@ -4,7 +4,11 @@ import { z } from "zod";
 
 // Helper: safely read an Adapty response and show what actually came back,
 // plus a masked preview of the key we sent, without ever exposing the full secret.
-async function describeAdaptyResponse(res: Response, keyUsed: string | undefined) {
+async function describeAdaptyResponse(
+	res: Response,
+	keyUsed: string | undefined,
+	env: unknown,
+) {
 	const raw = await res.text();
 	let parsed: unknown = null;
 	try {
@@ -15,6 +19,10 @@ async function describeAdaptyResponse(res: Response, keyUsed: string | undefined
 	const keyPreview = keyUsed
 		? `${keyUsed.slice(0, 8)}...${keyUsed.slice(-4)} (length ${keyUsed.length})`
 		: "ADAPTY_API_KEY is undefined/empty";
+	// Names only, never values — shows what the Worker actually sees bound at runtime,
+	// regardless of what the dashboard displays.
+	const visibleBindingNames =
+		env && typeof env === "object" ? Object.keys(env as object) : [];
 	return {
 		content: [
 			{
@@ -24,6 +32,7 @@ async function describeAdaptyResponse(res: Response, keyUsed: string | undefined
 						http_status: res.status,
 						ok: res.ok,
 						key_used: keyPreview,
+						visible_binding_names: visibleBindingNames,
 						body: parsed ?? raw,
 					},
 					null,
@@ -113,7 +122,7 @@ export class MyMCP extends McpAgent {
 						},
 					},
 				);
-				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY);
+				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY, this.env);
 			},
 		);
 
@@ -144,7 +153,7 @@ export class MyMCP extends McpAgent {
 						}),
 					},
 				);
-				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY);
+				return describeAdaptyResponse(res, this.env.ADAPTY_API_KEY, this.env);
 			},
 		);
 	}
